@@ -7,12 +7,12 @@ from torch.autograd import Variable
 import numpy as np
 import cv2 
 
-def unique(tensor):
+def unique(tensor):#因为同一类别可能会有多个真实检测结果，所以我们使用unique函数来去除重复的元素，即一类只留下一个元素，达到获取任意给定图像中存在的类别的目的
     tensor_np = tensor.cpu().numpy()
-    unique_np = np.unique(tensor_np)
+    unique_np = np.unique(tensor_np)#np.unique该函数是去除数组中的重复数字，并进行排序之后输出
     unique_tensor = torch.from_numpy(unique_np)
     
-    tensor_res = tensor.new(unique_tensor.shape)
+    tensor_res = tensor.new(unique_tensor.shape)# new(args, *kwargs) 构建[相同数据类型]的新Tensor
     tensor_res.copy_(unique_tensor)
     return tensor_res
 
@@ -34,6 +34,7 @@ def bbox_iou(box1, box2):
     inter_rect_y2 =  torch.min(b1_y2, b2_y2)
     
     #Intersection area
+    #这里没有对inter_area为负的情况进行判断，后面计算出来的IOU就可能是负的
     inter_area = torch.clamp(inter_rect_x2 - inter_rect_x1 + 1, min=0) * torch.clamp(inter_rect_y2 - inter_rect_y1 + 1, min=0)
 
     #Union Area
