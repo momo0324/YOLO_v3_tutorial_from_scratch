@@ -116,82 +116,123 @@ def predict_transform(prediction, inp_dim, anchors, num_classes, CUDA = True):
     return prediction
 
 def write_results(prediction, confidence, num_classes, nms_conf = 0.4):
+    # confidence: 输入的预测shape=(1,10647, 85)。conf_mask: shape=(1,10647) => 增加一维度之后 (1, 10647, 1)
     conf_mask = (prediction[:,:,4] > confidence).float().unsqueeze(2)
+    #预测张量包含有关Bx10647边界框的信息。对于含有目标的得分小于confidence的每个方框，它对应的含有目标的得分将变成0,即conf_mask中对应元素为0.而保留预测结果中置信度大于给定阈值的部分prediction的conf_mask
     prediction = prediction*conf_mask
-    
+     # 小于置信度的条目值全为0, 剩下部分不变。conf_mask中含有目标的得分小于confidence的方框所对应的含有目标的得分为0
+     #它会扩展成与prediction维度一样的tensor，所以含有目标的得分小于confidence的方框所有的属性都会变为0，故如果没有检测任何有效目标,则返回值为0
     box_corner = prediction.new(prediction.shape)
+    # prediction的前五个数据分别表示 (Cx, Cy, w, h, score)，这里创建一个新的数组，大小与predicton的大小相同   
+    #我们可以将我们的框的 (中心 x, 中心 y, 高度, 宽度) 属性转换成 (左上角 x, 左上角 y, 右下角 x, 右下角 y)
+    #这样做用每个框的两个对角坐标能更轻松地计算两个框的 IoU
     box_corner[:,:,0] = (prediction[:,:,0] - prediction[:,:,2]/2)
     box_corner[:,:,1] = (prediction[:,:,1] - prediction[:,:,3]/2)
     box_corner[:,:,2] = (prediction[:,:,0] + prediction[:,:,2]/2) 
     box_corner[:,:,3] = (prediction[:,:,1] + prediction[:,:,3]/2)
-    prediction[:,:,:4] = box_corner[:,:,:4]
+    prediction[:,:,:4] = box_corner[:,:,:4]# 计算后的新坐标复制回去
     
-    batch_size = prediction.size(0)
-
-    write = False
+    batch_size = prediction.size(0)# 第0个维度是batch_size
+    # output = prediction.new(1, prediction.size(2)+1) # shape=(1,85+1)
+    write = False# 拼接结果到output中最后返回
     
 
-
+    #对每一张图片得分的预测值进行NMS操作，因为每张图片的目标数量不一样，所以有效得分的方框的数量不一样，没法将几张图片同时处理，因此一次只能完成一张图的置信度阈值的设置和NMS,不能将所涉及的操作向量化.
+    #所以必须在预测的第一个维度上（batch数量）上遍历每张图片，将得分低于一定分数的去掉，对剩下的方框进行进行NMS
     for ind in range(batch_size):
-        image_pred = prediction[ind]          #image Tensor
-       #confidence threshholding 
-       #NMS
-    
+        image_pred = prediction[ind]
+        # 选择此batch中第ind个图像的预测结果,image_pred对应一张图片中所有方框的坐标(x1,y1,x2,y2)以及得分，是一个二维tensor 维度为10647x85
+        #image Tensor
+        #confidence threshholding 
+        #NMS
+
+        # 最大值索引, 最大值, 按照dim=1 方向计算
         max_conf, max_conf_score = torch.max(image_pred[:,5:5+ num_classes], 1)
+        # 维度扩展max_conf: shape=(10647->15) => (10647->15,1)添加一个列的维度，max_conf变成二维tensor，尺寸为10647x1
         max_conf = max_conf.float().unsqueeze(1)
         max_conf_score = max_conf_score.float().unsqueeze(1)
         seq = (image_pred[:,:5], max_conf, max_conf_score)
-        image_pred = torch.cat(seq, 1)
-        
+        #我们移除了每一行的这 80 个类别分数，只保留bbox4个坐标以及objectnness分数，转而增加了有最大值的类别分数及索引
+        #将每个方框的(x1,y1,x2,y2,s)与得分最高的这个类的分数s_cls(max_conf)和对应类的序号index_cls(max_conf_score)在列维度上连接起来
+        #将10647x5,10647x1,10647x1三个tensor 在列维度进行concatenate操作，得到一个10647x7的tensor,(x1,y1,x2,y2,s,s_cls,index_cls)
+        image_pred = torch.cat(seq, 1)# shape=(10647, 5+1+1=7)
+        #image_pred[:,4]是长度为10647的一维tensor,维度为4的列是置信度分数。假设有15个框含有目标的得分非0，返回15x1的tensor
         non_zero_ind =  (torch.nonzero(image_pred[:,4]))
+        #torch.nonzero返回的是索引，会让non_zero_ind是个2维tensor
         try:
+            # try-except模块的目的是处理无检测结果的情况.non_zero_ind.squeeze()将15x1的non_zero_ind去掉维度为1的维度，变成长度为15的一维tensor，相当于一个列向量，
+            # image_pred[non_zero_ind.squeeze(),:]是在image_pred中找到non_zero_ind中非0目标得分的行的所有元素(image_pred维度
+            # 是10647x7，找到其中的15行， 再用view(-1,7)将它变为15x7的tensor，用view()确保第二个维度必须是7
             image_pred_ = image_pred[non_zero_ind.squeeze(),:].view(-1,7)
         except:
             continue
         
-        if image_pred_.shape[0] == 0:
-            continue       
-#        
+        if image_pred_.shape[0] == 0:#当没有检测到时目标时，我们使用 continue 来跳过对本图像的循环，即进行下一次循环
+            continue
+
   
         #Get the various classes detected in the image
-        img_classes = unique(image_pred_[:,-1])  # -1 index holds the class index
+        # 获取当前图像检测结果中出现的所有类别
+        img_classes = unique(image_pred_[:,-1])  
+        # -1 index holds the class index
+        #用unique()除去重复的元素，即一类只留下一个元素，假设这里最后只剩下了3个元素，即只有3类物体
         
         
         for cls in img_classes:
             #perform NMS
+            #一旦我们进入循环，我们要做的第一件事就是提取特定类别（用变量 cls 表示）的检测结果,分离检测结果中属于当前类的数据 -1: index_cls, -2: s_cls
 
         
             #get the detections with one particular class
             cls_mask = image_pred_*(image_pred_[:,-1] == cls).float().unsqueeze(1)
             class_mask_ind = torch.nonzero(cls_mask[:,-2]).squeeze()
+            #cls_mask[:,-2]为cls_mask倒数第二列,是物体类别分数
+            #cls_mask本身为15x7，cls_mask[:,-2]将cls_mask的倒数第二列取出来，此时是1维tensor，torch.nonzero(cls_mask[:,-2])得到的是非零元素的索引，
+            #将返回一个二维tensor，这里是4x2，再用squeeze()去掉长度为1的维度(这里是第二维)，得到一维tensor
             image_pred_class = image_pred_[class_mask_ind].view(-1,7)
-            
+            #从prediction中取出属于cls类别的所有结果，为下一步的nms的输入
+            #找到image_pred_中对应cls类的所有方框的预测值，并转换为二维张量。这里4x7。image_pred_[class_mask_ind]本身得到的数据就是4x7，view(-1,7)是为了确保第二维为7
+
             #sort the detections such that the entry with the maximum objectness
             #confidence is at the top
             conf_sort_index = torch.sort(image_pred_class[:,4], descending = True )[1]
             image_pred_class = image_pred_class[conf_sort_index]
+            #根据排序后的索引对应出的bbox的坐标与分数，依然为4x7的tensor
             idx = image_pred_class.size(0)   #Number of detections
-            
+
+            #开始执行 "非极大值抑制" 操作
             for i in range(idx):
+                # 对已经有序的结果，每次开始更新后索引加一，挨个与后面的结果比较
                 #Get the IOUs of all boxes that come after the one we are looking at 
                 #in the loop
                 try:
+                    # image_pred_class[i].unsqueeze(0)，为什么要加unsqueeze(0)？这里image_pred_class为4x7的tensor，image_pred_class[i]是一个长度为7的tensor，要变成1x7的tensor，在第0维添加一个维度
                     ious = bbox_iou(image_pred_class[i].unsqueeze(0), image_pred_class[i+1:])
                 except ValueError:
                     break
+                #在for i in range(idx):这个循环中，因为有一些框(在image_pred_class对应一行)会被去掉，image_pred_class行数会减少，
+                #这样在后面的循环中，idx序号会超出image_pred_class的行数的范围，出现ValueError错误
+                #所以当抛出这个错误时，则跳出这个循环，因为此时已经没有更多可以去掉的方框
             
                 except IndexError:
                     break
             
                 #Zero out all the detections that have IoU > treshhold
                 iou_mask = (ious < nms_conf).float().unsqueeze(1)
-                image_pred_class[i+1:] *= iou_mask       
+                # 计算出需要保留的item（保留ious < nms_conf的框）而ious < nms_conf得到的是torch.uint8类型，用float()将它们转换为float类型。因为要与image_pred_class[i+1:]相乘，故长度为7的tensor，要变成1x7的tensor，需添加一个维度
+                image_pred_class[i+1:] *= iou_mask
+                #将iou_mask与比序号i大的框的预测值相乘，其中IOU大于阈值的框的预测值全部变成0.得出需要保留的框       
             
                 #Remove the non-zero entries
+                # 开始移除
                 non_zero_ind = torch.nonzero(image_pred_class[:,4]).squeeze()
                 image_pred_class = image_pred_class[non_zero_ind].view(-1,7)
-                
-            batch_ind = image_pred_class.new(image_pred_class.size(0), 1).fill_(ind)      #Repeat the batch_id for as many detections of the class cls in the image
+                # 当前类的nms执行完之后，下一次循环将对剩下的方框中得分第i+1高的方框进行NMS操作，因为刚刚已经对得分第1到i高的方框进行了NMS操作。直到最后一个方框循环完成为止
+                # 在每次进行NMS操作的时候，预测值tensor中都会有一些行(对应某些方框)被去掉。接下来是保存结果。
+                # new()创建了一个和image_pred_class类型相同的tensor，tensor行数等于cls这个类别所有的方框经过NMS剩下的方框的个数，即image_pred_class的行数，列数为1
+                #再将生成的这个tensor所有元素赋值为这些方框所属图片对应于batch中的序号ind(一个batch有多张图片同时测试)，用fill_(ind)实现   
+            
+            batch_ind = image_pred_class.new(image_pred_class.size(0), 1).fill_(ind) #Repeat the batch_id for as many detections of the class cls in the image
             seq = batch_ind, image_pred_class
             
             if not write:
@@ -202,36 +243,53 @@ def write_results(prediction, confidence, num_classes, nms_conf = 0.4):
                 output = torch.cat((output,out))
 
     try:
+        #在该函数结束时，我们会检查输出是否已被初始化。如果没有，就意味着在该 batch 的任意图像中都没有单个检测结果。在这种情况下，我们返回 0
         return output
     except:
+        # 如果所有的图片都没有检测到方框，则在前面不会进行NMS等操作，不会生成output，此时将在except中返回0
         return 0
-    
+     # 最终返回的output是一个batch中所有图片中剩下的方框的属性，一行对应一个方框，属性为(x1,y1,x2,y2,s,s_cls,index_cls)，
+     # ind 是这个方框所属图片在这个batch中的序号，x1,y1是在网络输入图片(416x416)坐标系中，方框左上角的坐标；x2,y2是在网络输入
+     # 图片(416x416)坐标系中，方框右下角的坐标。s是这个方框含有目标的得分s_cls是这个方框中所含目标最有可能的类别的概率得分，index_cls是s_cls对应的这个类别所对应的序号
+
 def letterbox_image(img, inp_dim):
+    #lteerbox_image()将图片按照纵横比进行缩放，将空白部分用(128,128,128)填充,调整图像尺寸
+    #具体而言,此时某个边正好可以等于目标长度,另一边小于等于目标长度
+    #将缩放后的数据拷贝到画布中心,返回完成缩放
     '''resize image with unchanged aspect ratio using padding'''
     img_w, img_h = img.shape[1], img.shape[0]
-    w, h = inp_dim
+    w, h = inp_dim#inp_dim是需要resize的尺寸
+    # 取min(w/img_w, h/img_h)这个比例来缩放，缩放后的尺寸为new_w, new_h,即保证较长的边缩放后正好等于目标长度(需要的尺寸)，另一边的尺寸缩放后还没有填充满
     new_w = int(img_w * min(w/img_w, h/img_h))
     new_h = int(img_h * min(w/img_w, h/img_h))
     resized_image = cv2.resize(img, (new_w,new_h), interpolation = cv2.INTER_CUBIC)
-    
+     #将图片按照纵横比不变来缩放为new_w x new_h，768 x 576的图片缩放成416x312.,用了双三次插值
+     # 创建一个画布, 将resized_image数据拷贝到画布中心
     canvas = np.full((inp_dim[1], inp_dim[0], 3), 128)
-
+    # 将wxhx3的array中对应new_wxnew_hx3的部分(这两个部分的中心应该对齐)赋值为刚刚由原图缩放得到的数组,得到最终缩放后图片
     canvas[(h-new_h)//2:(h-new_h)//2 + new_h,(w-new_w)//2:(w-new_w)//2 + new_w,  :] = resized_image
     
     return canvas
 
 def prep_image(img, inp_dim):
+    #prep_image用来将numpy数组转换成PyTorch需要的的输入格式。即（3，416,416）
+    #为神经网络准备输入图像数据
+    #返回值: 处理后图像, 原图, 原图尺寸
     """
     Prepare image for inputting to the neural network. 
     
     Returns a Variable 
     """
-    img = (letterbox_image(img, (inp_dim, inp_dim)))
+    img = (letterbox_image(img, (inp_dim, inp_dim)))# lteerbox_image()将图片按照纵横比进行缩放，将空白部分用(128,128,128)填充
     img = img[:,:,::-1].transpose((2,0,1)).copy()
+    #img是【h,w,channel】，这里的img[:,:,::-1]是将第三个维度channel从opencv的BGR转化为pytorch的RGB，然后transpose((2,0,1))的意思是将[height,width,channel]->[channel,height,width]
     img = torch.from_numpy(img).float().div(255.0).unsqueeze(0)
+    # from_numpy(()将ndarray数据转换为tensor格式，div(255.0)将每个元素除以255.0，进行归一化，unsqueeze(0)在0维上添加了一维
+    # 从3x416x416变成1x3x416x416，多出来的一维表示batch。这里就将图片变成了BxCxHxW的pytorch格式
     return img
 
-def load_classes(namesfile):
+def load_classes(namesfile):#load_classes会返回一个字典——将每个类别的索引映射到其名称的字符串
+    # 加载类名文件
     fp = open(namesfile, "r")
     names = fp.read().split("\n")[:-1]
     return names
