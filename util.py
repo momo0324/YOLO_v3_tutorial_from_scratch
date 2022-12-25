@@ -46,18 +46,32 @@ def bbox_iou(box1, box2):
     return iou
 
 def predict_transform(prediction, inp_dim, anchors, num_classes, CUDA = True):
-
+    #在特征图上进行多尺度预测, 在GRID每个位置都有三个不同尺度的锚点.predict_transform()利用一个scale得到的feature map预测得到的每个anchor的属性(x,y,w,h,s,s_cls1,s_cls2...),其中x,y,w,h
+    #是在网络输入图片坐标系下的值,s是方框含有目标的置信度得分，s_cls1,s_cls_2等是方框所含目标对应每类的概率。输入的feature map(prediction变量) 
+    #维度为(batch_size, num_anchors*bbox_attrs, grid_size, grid_size)，类似于一个batch彩色图片BxCxHxW存储方式
+    #并且将结果的维度变换成(batch_size, grid_size*grid_size*num_anchors, 5+类别数量)的tensor，同时得到每个方框在网络输入图片(416x416)坐标系下的(x,y,w,h)以及方框含有目标的得分以及每个类的得分。
     
     batch_size = prediction.size(0)
-    stride =  inp_dim // prediction.size(2)
+    #stride表示的是整个网络的步长，等于图像原始尺寸与yolo层输入的feature mapr尺寸相除，因为输入图像是正方形，所以用高相除即可
+    stride =  inp_dim // prediction.size(2)#416//13=32
+    # feature map每条边格子的数量，416//32=13
     grid_size = inp_dim // stride
+    # 一个方框属性个数，等于5+类别数量
     bbox_attrs = 5 + num_classes
+     # anchors数量
     num_anchors = len(anchors)
+    # 输入的prediction维度为(batch_size, num_anchors * bbox_attrs, grid_size, grid_size)，类似于一个batch彩色图片
+    # 存储方式，将它的维度变换成(batch_size, bbox_attrs*num_anchors, grid_size*grid_size)
     
     prediction = prediction.view(batch_size, bbox_attrs*num_anchors, grid_size*grid_size)
+    #contiguous：view只能用在contiguous的variable上。如果在view之前用了transpose, permute等，需要用contiguous()来返回一个contiguous copy
     prediction = prediction.transpose(1,2).contiguous()
+    # 将prediction维度转换成(batch_size, grid_size*grid_size*num_anchors, bbox_attrs)。不看batch_size，
+    # (grid_size*grid_size*num_anchors, bbox_attrs)相当于将所有anchor按行排列，即一行对应一个anchor属性，此时的属性仍然是feature map得到的值
     prediction = prediction.view(batch_size, grid_size*grid_size*num_anchors, bbox_attrs)
+    # 锚点的维度与net块的height和width属性一致。这些属性描述了输入图像的维度，比feature map的规模大（二者之商即是步幅）。因此，我们必须使用stride分割锚点。变换后的anchors是相对于最终的feature map的尺寸
     anchors = [(a[0]/stride, a[1]/stride) for a in anchors]
+   
 
     #Sigmoid the  centre_X, centre_Y. and object confidencce
     prediction[:,:,0] = torch.sigmoid(prediction[:,:,0])
@@ -65,16 +79,18 @@ def predict_transform(prediction, inp_dim, anchors, num_classes, CUDA = True):
     prediction[:,:,4] = torch.sigmoid(prediction[:,:,4])
     
     #Add the center offsets
+    #这里生成了每个格子的左上角坐标，生成的坐标为grid x grid的二维数组，a，b分别对应这个二维矩阵的x,y坐标的数组，a,b的维度与grid维度一样。每个grid cell的尺寸均为1，故grid范围是[0,12]（假如当前的特征图13*13）
     grid = np.arange(grid_size)
+     #x_offset即cx,y_offset即cy，表示当前cell左上角坐标
     a,b = np.meshgrid(grid, grid)
 
-    x_offset = torch.FloatTensor(a).view(-1,1)
+    x_offset = torch.FloatTensor(a).view(-1,1)#view是reshape功能，-1表示自适应
     y_offset = torch.FloatTensor(b).view(-1,1)
 
     if CUDA:
         x_offset = x_offset.cuda()
         y_offset = y_offset.cuda()
-
+        #这里的x_y_offset对应的是最终的feature map中每个格子的左上角坐标
     x_y_offset = torch.cat((x_offset, y_offset), 1).repeat(1,num_anchors).view(-1,2).unsqueeze(0)
 
     prediction[:,:,:2] += x_y_offset
@@ -84,13 +100,18 @@ def predict_transform(prediction, inp_dim, anchors, num_classes, CUDA = True):
 
     if CUDA:
         anchors = anchors.cuda()
-
+    #这里的anchors本来是一个长度为6的list(三个anchors每个2个坐标)，然后在0维上(行)进行了grid_size*grid_size个复制，在1维(列)上
+    # 一次复制(没有变化)，即对每个格子都得到三个anchor。Unsqueeze(0)的作用是在数组上添加一维，这里是在第0维上添加的
+    # 添加grid_size是为了之后的公式bw=pw×e^tw的tw。
     anchors = anchors.repeat(grid_size*grid_size, 1).unsqueeze(0)
+    #对网络预测得到的矩形框的宽高的偏差值进行指数计算，然后乘以anchors里面对应的宽高(这里的anchors里面的宽高是对应最终的feature map尺寸grid_size)，
+    # 得到目标的方框的宽高，这里得到的宽高是相对于在feature map的尺寸
     prediction[:,:,2:4] = torch.exp(prediction[:,:,2:4])*anchors
-    
+    # 这里得到每个anchor中每个类别的得分。将网络预测的每个得分用sigmoid()函数计算得到
     prediction[:,:,5: 5 + num_classes] = torch.sigmoid((prediction[:,:, 5 : 5 + num_classes]))
 
     prediction[:,:,:4] *= stride
+    #将相对于最终feature map的方框坐标和尺寸映射回输入网络图片(416x416)，即将方框的坐标乘以网络的stride即可
     
     return prediction
 
